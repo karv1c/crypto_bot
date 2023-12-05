@@ -1,0 +1,57 @@
+CREATE TABLE transactions (
+  id BIGSERIAL PRIMARY KEY,
+  trader TEXT NOT NULL,
+  prim TEXT NOT NULL,
+  token TEXT NOT NULL,
+  key_hash TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  price_usd DOUBLE PRECISION NOT NULL,
+  price DOUBLE PRECISION NOT NULL,
+  token_amount DOUBLE PRECISION NOT NULL,
+  prim_amount DOUBLE PRECISION NOT NULL,
+  usd_amount DOUBLE PRECISION NOT NULL,
+  swap_action TEXT NOT NULL,
+  ts BIGINT NOT NULL
+);
+
+CREATE TABLE traders (
+  id BIGSERIAL PRIMARY KEY,
+  trader TEXT NOT NULL,
+  token TEXT NOT NULL,
+  key_hash TEXT NOT NULL,
+  buy_count INTEGER NOT NULL,
+  sell_count INTEGER NOT NULL,
+  deposit DOUBLE PRECISION NOT NULL,
+  token_amount DOUBLE PRECISION NOT NULL,
+  min_price DOUBLE PRECISION NOT NULL,
+  max_price DOUBLE PRECISION NOT NULL,
+  sum_buy_usd_amount DOUBLE PRECISION NOT NULL,
+  sum_buy_token_amount DOUBLE PRECISION NOT NULL,
+  wmean_buy DOUBLE PRECISION NOT NULL,
+  sum_sell_usd_amount DOUBLE PRECISION NOT NULL,
+  sum_sell_token_amount DOUBLE PRECISION NOT NULL,
+  wmean_sell DOUBLE PRECISION NOT NULL,
+  wmean_ratio REAL NOT NULL,
+  max_single_buy DOUBLE PRECISION NOT NULL,
+  min_single_buy DOUBLE PRECISION NOT NULL,
+  max_single_sell DOUBLE PRECISION NOT NULL,
+  min_single_sell DOUBLE PRECISION NOT NULL,
+  max_buy_seq DOUBLE PRECISION NOT NULL,
+  cur_buy_seq DOUBLE PRECISION NOT NULL,
+  max_sell_seq DOUBLE PRECISION NOT NULL,
+  cur_sell_seq DOUBLE PRECISION NOT NULL,
+  active BOOLEAN NOT NULL,
+  ts BIGINT NOT NULL
+);
+
+CREATE TABLE tokens (
+  id SERIAL PRIMARY KEY,
+  token TEXT NOT NULL,
+  creation_ts BIGINT NOT NULL,
+  tradable BOOLEAN DEFAULT NULL
+);
+
+CREATE TABLE repeat_traders (
+  id SERIAL PRIMARY KEY,
+  keyhash TEXT NOT NULL
+);
