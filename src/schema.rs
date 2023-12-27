@@ -4,6 +4,14 @@ diesel::table! {
     repeat_traders (id) {
         id -> Int4,
         keyhash -> Text,
+        token_amount -> Float8,
+    }
+}
+
+diesel::table! {
+    tg_chat_ids (id) {
+        id -> Int4,
+        chat_id -> Int8,
     }
 }
 
@@ -13,6 +21,7 @@ diesel::table! {
         token -> Text,
         creation_ts -> Int8,
         tradable -> Nullable<Bool>,
+        symbol -> Nullable<Text>,
     }
 }
 
@@ -68,6 +77,7 @@ diesel::table! {
 
 diesel::allow_tables_to_appear_in_same_query!(
     repeat_traders,
+    tg_chat_ids,
     tokens,
     traders,
     transactions,

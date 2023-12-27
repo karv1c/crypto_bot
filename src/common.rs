@@ -29,9 +29,9 @@ pub const HTTP_URL: &str = "http://127.0.0.1:8545";
 pub const WS_URL: &str = "ws://127.0.0.1:8546";
 
 lazy_static! {
-    static ref WBNB_ADDRESS: H160 =
+    pub static ref WBNB_ADDRESS: H160 =
         H160::from_str("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c").unwrap();
-    static ref BP_BSC_USD_ADDRESS: H160 =
+    pub static ref BP_BSC_USD_ADDRESS: H160 =
         H160::from_str("0x55d398326f99059ff775485246999027b3197955").unwrap();
     static ref PEG_BUSD_ADDRESS: H160 =
         H160::from_str("0xe9e7cea3dedca5984780bafc599bd69add087d56").unwrap();
@@ -40,7 +40,7 @@ lazy_static! {
 use std::str::FromStr;
 
 use crate::abi::*;
-use crate::schema;
+use crate::schema::{self, repeat_traders};
 use crate::trader::{NewRepeatTraderEntry, NewTokenEntry, TokenEntry, TraderEntry};
 
 #[derive(
@@ -335,7 +335,7 @@ impl SwapTx {
     ) -> Result<Option<TraderEntry>> {
         let conn = &mut db_pool.get()?;
 
-        let prim_address = self.addresses.prim_address;
+        //let prim_address = self.addresses.prim_address;
         let token_address = self.addresses.token_address;
 
         if self.from == H160::from_str(REAPEAT_ADDRESS)? {
@@ -346,7 +346,7 @@ impl SwapTx {
 
         let trader: Option<TraderEntry> = conn.transaction(|conn| {
             schema::traders::table
-                .filter(schema::traders::key_hash.eq(key_hash))
+                .filter(schema::traders::key_hash.eq(key_hash.clone()))
                 .first::<TraderEntry>(conn)
                 .optional()
         })?;
@@ -362,21 +362,36 @@ impl SwapTx {
                 return Ok(Some(trader));
             } else {
                 let token_decimals = self.token_decimals().await?;
-                let trader_token_amount = U256::from(
-                    (trader.token_amount * 10.0_f64.powi(token_decimals as i32)) as u128,
+                let keyhash_token_balance: f64 = conn.transaction(|conn| {
+                    repeat_traders::table
+                        .filter(repeat_traders::keyhash.eq(key_hash))
+                        .select(repeat_traders::token_amount)
+                        .first::<f64>(conn)
+                })?;
+
+                let keyhash_token_balance = U256::from(
+                    (keyhash_token_balance * 10.0f64.powi(token_decimals as i32)) as u128,
                 );
-                let sell_tx = self.context.router_contract.swap_tokens_for_exact_eth(
-                    trader_token_amount,
+
+                //let prim_balance = self.prim_balance(REAPEAT_ADDRESS).await?;
+                let tokens_left = self.token_balance(REAPEAT_ADDRESS).await?;
+                let repeat_address = H160::from_str(REAPEAT_ADDRESS).unwrap();
+                /* let trader_token_amount = U256::from(
+                    (trader.token_amount * 10.0_f64.powi(token_decimals as i32)) as u128,
+                ).min(tokens_left); */
+                info!("Selling tokens of {:?}", trader.trader);
+                let sell_tx = self.context.router_contract.swap_exact_tokens_for_eth(
+                    keyhash_token_balance.min(tokens_left),
                     U256::zero(),
-                    vec![token_address, prim_address],
-                    self.from,
+                    vec![token_address, *WBNB_ADDRESS],
+                    repeat_address,
                     U256::from(now() + 3 * 3600),
                 );
-                let gas_limit = self.tx.gas;
+                let gas_limit = self.tx.gas.max(U256::from(2000000_u32));
                 let gas_price = self.tx.gas_price.unwrap_or(U256::from(3000000000_u32));
                 let receipt = sell_tx
                     .gas_price(gas_price)
-                    .from(self.from)
+                    .from(repeat_address)
                     .gas(gas_limit)
                     .send()
                     .await?
@@ -392,7 +407,7 @@ impl SwapTx {
                         info!(wmean_ratio=%trader.wmean_ratio, %buy_sell_ratio, "Trader's parameters are not met required anymore");
                         info!("{tx:?}");
                     }
-                    None => todo!(),
+                    None => error!("No receipt for sell all traders tokens"),
                 }
 
                 conn.transaction(|conn| {
@@ -435,6 +450,7 @@ impl SwapTx {
                 if now() - token_entry.creation_ts > 30 * 24 * 3600 {
                     let new_repeat = NewRepeatTraderEntry {
                         keyhash: self.get_keyhash(),
+                        token_amount: 0.0,
                     };
                     conn.transaction(|conn| {
                         diesel::insert_into(schema::repeat_traders::table)
@@ -446,6 +462,17 @@ impl SwapTx {
                             .set(schema::traders::active.eq(true))
                             .execute(conn)
                     })?;
+
+                    let convertable_min_token = self.min_token_sell(5.0).await;
+
+                    match convertable_min_token {
+                        Ok(convertable_min_token) => {
+                            if convertable_min_token.is_zero() {
+                                return Ok(None);
+                            }
+                        }
+                        Err(_) => return Ok(None),
+                    }
                     return Ok(Some(trader));
                     /* match token_entry.tradable {
                         Some(tradable) => {
@@ -479,11 +506,14 @@ impl SwapTx {
 
             let creation_ts = self.get_creation_ts().await?;
 
+            let symbol = self.symbol().await;
+
             if now() - creation_ts > 30 * 24 * 3600 {
                 let new_token = NewTokenEntry {
                     token: trader.token.clone(),
                     creation_ts,
                     tradable: None,
+                    symbol,
                 };
                 conn.transaction(|conn| {
                     diesel::insert_into(schema::tokens::table)
@@ -492,6 +522,7 @@ impl SwapTx {
                 })?;
                 let new_repeat = NewRepeatTraderEntry {
                     keyhash: self.get_keyhash(),
+                    token_amount: 0.0,
                 };
                 conn.transaction(|conn| {
                     diesel::insert_into(schema::repeat_traders::table)
@@ -503,6 +534,18 @@ impl SwapTx {
                         .set(schema::traders::active.eq(true))
                         .execute(conn)
                 })?;
+
+                let convertable_min_token = self.min_token_sell(5.0).await;
+
+                match convertable_min_token {
+                    Ok(convertable_min_token) => {
+                        if convertable_min_token.is_zero() {
+                            return Ok(None);
+                        }
+                    }
+                    Err(_) => return Ok(None),
+                }
+
                 return Ok(Some(trader));
                 // MAKE TEST SWAP
                 /* let tradable = true; //self.is_tradable().await;
@@ -537,6 +580,7 @@ impl SwapTx {
                     token: trader.token.clone(),
                     creation_ts,
                     tradable: None,
+                    symbol,
                 };
                 conn.transaction(|conn| {
                     diesel::insert_into(schema::tokens::table)
@@ -636,6 +680,11 @@ impl SwapTx {
         Ok(decimals)
     }
 
+    pub async fn symbol(&self) -> Option<String> {
+        let contract = &self.contracts.token_contract;
+        contract.symbol().await.ok()
+    }
+
     pub async fn prim_decimals(&self) -> Result<u32> {
         self.decimals(true).await
     }
@@ -653,6 +702,25 @@ impl SwapTx {
             .call()
             .await?;
         Ok(balance)
+    }
+
+    pub async fn token_usd_balance(
+        &self,
+        token_balance: U256,
+        addresses: Vec<H160>,
+    ) -> Result<U256> {
+        let token_amount = self
+            .context
+            .router_contract
+            .get_amounts_out(token_balance, addresses)
+            .call()
+            .await?;
+        info!(?token_amount);
+        let token_usd_balance = token_amount
+            .last()
+            .cloned()
+            .ok_or(anyhow!("No last token amount"))?;
+        Ok(token_usd_balance)
     }
 
     pub async fn prim_balance(&self, address: &str) -> Result<U256> {
@@ -732,6 +800,108 @@ impl SwapTx {
             Ok(1.0)
         }
     }
+
+    /// Minimum sell token amount in USD
+    pub async fn min_token_sell(&self, min_usd_sell_amount: f64) -> Result<U256> {
+        let token_address = self.token_address();
+        //let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
+        let addresses = vec![*BP_BSC_USD_ADDRESS, token_address];
+        if let Ok(min_token_amount) = self
+            .context
+            .router_contract
+            .get_amounts_out(
+                U256::from((min_usd_sell_amount * 10.0_f64.powi(18)) as u128),
+                addresses,
+            )
+            .call()
+            .await
+        {
+            let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
+            let min_token_amount_wbnb = self
+                .context
+                .router_contract
+                .get_amounts_out(
+                    U256::from((min_usd_sell_amount * 10.0_f64.powi(18)) as u128),
+                    addresses,
+                )
+                .call()
+                .await?;
+            let Some(min_token_amount_wbnb) = min_token_amount_wbnb.last() else {
+                bail!("No last token amount");
+            };
+            let Some(min_token_amount) = min_token_amount.last() else {
+                bail!("No last token amount");
+            };
+            let result = min_token_amount.max(min_token_amount_wbnb);
+            return Ok(*result);
+        } else {
+            let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
+            let min_token_amount_wbnb = self
+                .context
+                .router_contract
+                .get_amounts_out(
+                    U256::from((min_usd_sell_amount * 10.0_f64.powi(18)) as u128),
+                    addresses,
+                )
+                .call()
+                .await?;
+            let Some(min_token_amount_wbnb) = min_token_amount_wbnb.last() else {
+                bail!("No last token amount");
+            };
+            return Ok(*min_token_amount_wbnb);
+        }
+    }
+
+    /// Check if maximum token buy limitis exceeded in USD
+    pub async fn is_exceeded(
+        &self,
+        max_total_usd_token_buy: f64,
+        token_balance: U256,
+    ) -> Result<bool> {
+        let token_address = self.token_address();
+        let addresses = vec![token_address, *BP_BSC_USD_ADDRESS];
+
+        info!(?token_balance, ?token_address, ?addresses);
+
+        if token_balance.is_zero() {
+            return Ok(false);
+        }
+
+        let token_usd_balance =
+            if let Ok(token_usd_balance) = self.token_usd_balance(token_balance, addresses).await {
+                let addresses = vec![token_address, *WBNB_ADDRESS, *BP_BSC_USD_ADDRESS];
+                let token_usd_balance_wbnb = self
+                    .token_usd_balance(token_balance, addresses)
+                    .await
+                    .unwrap_or_default();
+
+                let result = token_usd_balance.max(token_usd_balance_wbnb);
+
+                result
+            } else {
+                let addresses = vec![token_address, *WBNB_ADDRESS, *BP_BSC_USD_ADDRESS];
+                let token_usd_balance = self.token_usd_balance(token_balance, addresses).await?;
+                token_usd_balance
+            };
+
+        let max_usd_token_amount =
+            U256::from((max_total_usd_token_buy * 10.0_f64.powi(18)) as u128);
+        info!(%token_usd_balance, %max_usd_token_amount);
+        if token_usd_balance > max_usd_token_amount {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /* pub async fn format_tg_response(&self) -> Result<String> {
+        let mut result;
+        let action = self.action;
+        result = if action.is_buy() {
+            format!("{result}BUY \n")
+        } else {
+            format!("{result}SELL \n")
+        }
+    } */
 }
 
 #[derive(Serialize, Deserialize)]
@@ -837,17 +1007,22 @@ impl SwapContext {
                 .with_signer(signer.with_chain_id(56_u64)),
         );
 
-        /* if let Ok(x) =  {
-            let y = provider.get_block(x).await?.unwrap().timestamp;
-            println!("{y}");
-        } */
-        //let x = provider..get_block(enough_block).await?;
-        //33643549
-        //0x52242cbAb41e290E9E17CCC50Cc437bB60020a9d
-
-        //0xf51757C5C8DB6D8B8171b01a65e7Af0583E22622
         let router_contract = Pancake::new(H160::from_str(PANCAKESWAP_ADDRESS)?, provider.clone());
 
+        let token_aadr = H160::from_str("8a7b5fe6f43db70affc51f3881ff79354640f3e7").unwrap();
+        let token = Erc20Token::new(token_aadr, provider.clone());
+        let token_decimals = token.decimals().await? as i32;
+        //let balance = token.balance_of(H160::from_str(REAPEAT_ADDRESS)?).call().await?;
+        let keyhash_token_balance =
+            U256::from((3400.0 * 10.0f64.powi(token_decimals as i32)) as u128);
+        println!("{keyhash_token_balance}");
+        let addresses = vec![token_aadr, *BP_BSC_USD_ADDRESS];
+        let token_amount = router_contract
+            .get_amounts_out(keyhash_token_balance, addresses)
+            .call()
+            .await?;
+
+        info!(?token_amount);
         for address in eth {
             let prim_contract = Erc20Token::new(address, provider.clone());
 
@@ -895,8 +1070,84 @@ impl SwapContext {
             function_map,
             eth,
             router_contract,
-            bscscan_api
+            bscscan_api,
         }))
+    }
+
+    pub async fn get_token_usd_balance(&self, token: H160) -> Result<U256> {
+        let repeat_address = H160::from_str(REAPEAT_ADDRESS).unwrap();
+        let provider = self.provider.clone();
+        let token_contract = Erc20Token::new(token, provider.clone());
+        let balance = token_contract.balance_of(repeat_address).call().await?;
+        if balance.is_zero() {
+            return Ok(U256::zero());
+        }
+        let mut addresses = if token == *WBNB_ADDRESS {
+            vec![*WBNB_ADDRESS, *BP_BSC_USD_ADDRESS]
+        } else {
+            vec![token, *BP_BSC_USD_ADDRESS]
+        };
+
+        if token != *WBNB_ADDRESS {
+            if let Ok(token_amount) = self
+                .router_contract
+                .get_amounts_out(balance, addresses.clone())
+                .call()
+                .await
+            {
+                if let Some(token_usd_balance) = token_amount.last() {
+                    error!("No last {token:?} usd amount");
+                    addresses = vec![token, *WBNB_ADDRESS, *BP_BSC_USD_ADDRESS];
+                    let token_amount = self
+                        .router_contract
+                        .get_amounts_out(balance, addresses)
+                        .call()
+                        .await
+                        .unwrap_or_default();
+                    let Some(token_usd_balance_wbnb) = token_amount.last() else {
+                        error!("No last {token:?} usd wbnb amount");
+                        return Ok(*token_usd_balance);
+                    };
+
+                    let result = token_usd_balance.max(token_usd_balance_wbnb);
+
+                    return Ok(*result);
+                };
+            } else {
+                addresses = vec![token, *WBNB_ADDRESS, *BP_BSC_USD_ADDRESS];
+            }
+        }
+        let token_amount = self
+            .router_contract
+            .get_amounts_out(balance, addresses)
+            .call()
+            .await?;
+        let Some(token_usd_balance) = token_amount.last() else {
+            bail!("No last token amount");
+        };
+
+        Ok(*token_usd_balance)
+    }
+
+    pub async fn usdt_balance(&self) -> Result<U256> {
+        let repeat_address = H160::from_str(REAPEAT_ADDRESS).unwrap();
+        let provider = self.provider.clone();
+        let token_contract = Erc20Token::new(*BP_BSC_USD_ADDRESS, provider.clone());
+
+        let balance = token_contract.balance_of(repeat_address).call().await?;
+        Ok(balance)
+    }
+
+    pub async fn eth_usd_balance(&self) -> Result<U256> {
+        let repeat_address = H160::from_str(REAPEAT_ADDRESS).unwrap();
+        let eth_balance = self.provider.get_balance(repeat_address, None).await?;
+        let addresses = vec![*WBNB_ADDRESS, *BP_BSC_USD_ADDRESS];
+        let bnb_price = self
+            .router_contract
+            .get_amounts_out(eth_balance, addresses)
+            .call()
+            .await?;
+        Ok(bnb_price[1])
     }
 }
 

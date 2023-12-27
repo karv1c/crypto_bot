@@ -1,10 +1,11 @@
-use crate::common::SwapTx;
 use crate::common::*;
-use anyhow::bail;
-use anyhow::Result;
+use crate::schema::{tg_chat_ids, repeat_traders};
+use crate::telegram::ChatIdEntry;
+use crate::SharedSettings;
+use crate::trader::SelfTx;
+use anyhow::{bail, Result};
 use diesel::prelude::*;
-use diesel::r2d2::ConnectionManager;
-use diesel::r2d2::Pool;
+use diesel::r2d2::{ConnectionManager, Pool};
 use ethers::abi::Token;
 use ethers::prelude::*;
 use k256::ecdsa::SigningKey;
@@ -16,11 +17,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
+use teloxide::prelude::*;
 use tokio::select;
 use tracing::{error, info, warn};
-use teloxide::prelude::*;
-
-pub const SLIPPAGE_TOLLERANCE: i32 = 10;
 
 #[derive(Clone)]
 pub struct SwapQueue {
@@ -85,20 +84,20 @@ impl Future for PopFront {
 }
 
 pub struct RepeaterModule {
-    pub max_repeat: i64,
     //pub provider: SignerMiddleware<Provider<Http>, Wallet<SigningKey>>,
     pub tx_queue: SwapQueue,
     pub db_pool: Pool<ConnectionManager<PgConnection>>,
     pub bot: Bot,
+    pub tx_repeat_tx: tokio::sync::mpsc::Sender<SelfTx>,
 }
 
 impl RepeaterModule {
-    pub fn new(max_repeat: i64, db_pool: Pool<ConnectionManager<PgConnection>>, bot: Bot) -> Self {
+    pub fn new(db_pool: Pool<ConnectionManager<PgConnection>>, bot: Bot, tx_repeat_tx: tokio::sync::mpsc::Sender<SelfTx>) -> Self {
         Self {
-            max_repeat,
             db_pool,
             tx_queue: SwapQueue::new(),
             bot,
+            tx_repeat_tx,
         }
     }
 
@@ -106,18 +105,27 @@ impl RepeaterModule {
         &self,
         mut rx_tx: tokio::sync::broadcast::Receiver<SwapTx>,
         enabled: bool,
-        ids: Arc<Mutex<Vec<ChatId>>>,
+        settings: SharedSettings,
     ) -> Result<()> {
         let tx_queue: SwapQueue = self.tx_queue.clone();
         let db_pool = self.db_pool.clone();
-        let max_repeat = self.max_repeat;
         let bot = self.bot.clone();
+        let tx_repeated_tx = self.tx_repeat_tx.clone();
         tokio::spawn(async move {
-            let ids = ids.clone();
+            //let ids = ids.clone();
             loop {
                 let tx = tx_queue.pop_front().await;
-                if let Err(e) = handle_transaction(db_pool.clone(), tx, max_repeat, ids.clone(), bot.clone()).await {
+                if let Err(e) = handle_transaction(
+                    db_pool.clone(),
+                    tx,
+                    settings.clone(),
+                    bot.clone(),
+                    tx_repeated_tx.clone(),
+                )
+                .await
+                {
                     error!("Error while handling tx: {e}");
+                    
                 }
             }
         });
@@ -151,13 +159,27 @@ impl RepeaterModule {
 pub async fn handle_transaction(
     db_pool: Pool<ConnectionManager<PgConnection>>,
     swap_tx: SwapTx,
-    max_repeat: i64,
-    ids: Arc<Mutex<Vec<ChatId>>>,
+    settings: SharedSettings,
     bot: Bot,
+    tx_repeated_tx: tokio::sync::mpsc::Sender<SelfTx>,
 ) -> Result<()> {
+
+    let timer_tx_recieved = std::time::Instant::now();
+    let settings_bucket = settings.lock().await;
+    let settings = settings_bucket
+        .get(&"trading_settings")
+        .ok()
+        .flatten()
+        .map(|x| x.0)
+        .unwrap_or_default();
+
+    let max_repeat = settings.max_repeat_traders as i64;
+
     let Some(trader) = swap_tx.need_repeat(db_pool.clone(), max_repeat).await? else {
         return Ok(());
     };
+
+    info!(timer_need_repeat=%timer_tx_recieved.elapsed().as_millis());
 
     let tx = swap_tx.tx();
     info!(hash=?tx.hash, method=?swap_tx.method, action=?swap_tx.action, "Trying to repeat");
@@ -191,10 +213,18 @@ pub async fn handle_transaction(
 
     let usd_in_prim = 1.0 / denominator;
 
-    let max_cash = U256::from((20.0 * usd_in_prim * 10.0_f64.powi(prim_decimals as i32)) as u128);
+    let usd_buy_max_limit = settings.max_usd_buy_limit;
+    let usd_buy_min_limit = settings.min_usd_buy_limit;
+    let buy_slippage_tollerance = settings.buy_slippage_tollerance;
+    let sell_slippage_tollerance = settings.sell_slippage_tollerance;
+    let min_usd_sell_limit = settings.min_usd_sell_limit;
+
+    let max_cash =
+        U256::from((usd_buy_max_limit * usd_in_prim * 10.0_f64.powi(prim_decimals as i32)) as u128);
     let max_single_buy =
         U256::from((trader.max_single_buy * 10.0_f64.powi(prim_decimals as i32)) as u128);
-    let min_cash = U256::from((10.0 * usd_in_prim * 10.0_f64.powi(prim_decimals as i32)) as u128);
+    let min_cash =
+        U256::from((usd_buy_min_limit * usd_in_prim * 10.0_f64.powi(prim_decimals as i32)) as u128);
     let min_single_buy =
         U256::from((trader.min_single_buy * 10.0_f64.powi(prim_decimals as i32)) as u128);
     let trader_token_amount =
@@ -235,9 +265,25 @@ pub async fn handle_transaction(
         }
     }
 
+    let mut conn = db_pool.get()?;
+    let keyhash = swap_tx.get_keyhash();
+    let keyhash_token_balance: f64 = conn.transaction(|conn| {
+        repeat_traders::table.filter(repeat_traders::keyhash.eq(keyhash.clone())).select(repeat_traders::token_amount).first::<f64>(conn)
+    })?;
+
+    let keyhash_token_balance = U256::from((keyhash_token_balance * 10.0f64.powi(token_decimals as i32)) as u128);
+
     let prim_balance = swap_tx.prim_balance(REAPEAT_ADDRESS).await?;
 
     if swap_tx.is_buy() {
+        let is_exceeded = swap_tx.is_exceeded(settings.max_total_usd_buy_limit, keyhash_token_balance).await?;
+        
+        info!(timer_is_exceeded=%timer_tx_recieved.elapsed().as_millis());
+        if is_exceeded {
+            info!("Total token USD buy limit is exceeded");
+            return Ok(());
+        }
+
         if prim_balance <= U256::zero() {
             info!("Zero prim balace");
             return Ok(());
@@ -247,7 +293,7 @@ pub async fn handle_transaction(
     let amount_in_balance = if swap_tx.is_buy() {
         prim_balance
     } else {
-        token_balance
+        keyhash_token_balance.min(token_balance)
     };
     let mut repeat_value = repeat_value.min(eth_balance);
 
@@ -285,17 +331,19 @@ pub async fn handle_transaction(
                     let slippage_tollerance = new_amount_out_min
                         .checked_div(U256::from(100))
                         .unwrap_or_default()
-                        .checked_mul(U256::from(SLIPPAGE_TOLLERANCE))
+                        .checked_mul(U256::from(buy_slippage_tollerance))
                         .unwrap_or_default();
 
                     repeat_input_tokens[1] =
                         Token::Uint(new_amount_out_min.saturating_sub(slippage_tollerance));
                 }
                 SwapAction::Sell => {
+                    let min_token_sell = swap_tx.min_token_sell(min_usd_sell_limit).await?;
                     let new_amount_in = U256::from(
-                        (trader_amount_in.as_u128() as f64 / trader_token_amount.as_u128() as f64
-                            * token_balance.as_u128() as f64) as u128,
+                        (trader_amount_in.min(U256::from(U128::MAX)).as_u128() as f64 / trader_token_amount.min(U256::from(U128::MAX)).as_u128() as f64
+                            * keyhash_token_balance.min(U256::from(U128::MAX)).as_u128() as f64) as u128,
                     )
+                    .max(min_token_sell)
                     .min(amount_in_balance);
 
                     info!(%new_amount_in);
@@ -313,7 +361,7 @@ pub async fn handle_transaction(
                     let slippage_tollerance = new_amount_out_min
                         .checked_div(U256::from(100))
                         .unwrap_or_default()
-                        .checked_mul(U256::from(SLIPPAGE_TOLLERANCE))
+                        .checked_mul(U256::from(sell_slippage_tollerance))
                         .unwrap_or_default();
 
                     repeat_input_tokens[1] =
@@ -334,13 +382,13 @@ pub async fn handle_transaction(
                 SwapAction::Buy => {
                     let new_amount_in_max = reapeat_amount(trader_amount_in_max);
                     if new_amount_in_max > amount_in_balance {
-                        bail!("Not enough prim tokens {amount_in_balance} > {amount_in_balance}");
+                        bail!("Not enough prim tokens {new_amount_in_max} > {amount_in_balance}");
                     }
 
                     let slippage_tollerance = new_amount_in_max
                         .checked_div(U256::from(100))
                         .unwrap_or_default()
-                        .checked_mul(U256::from(SLIPPAGE_TOLLERANCE))
+                        .checked_mul(U256::from(buy_slippage_tollerance))
                         .unwrap_or_default();
 
                     repeat_input_tokens[1] =
@@ -357,17 +405,20 @@ pub async fn handle_transaction(
                     repeat_input_tokens[0] = Token::Uint(new_amount_out);
                 }
                 SwapAction::Sell => {
+                    let min_token_sell = swap_tx.min_token_sell(min_usd_sell_limit).await?;
+                    //let min_token_sell = U256::from((min_usd_sell_limit * 10_f64.powi(18)) as u128)/token_price;
                     let new_amount_in_max = U256::from(
-                        (trader_amount_in_max.as_u128() as f64
-                            / trader_token_amount.as_u128() as f64
-                            * token_balance.as_u128() as f64) as u128,
+                        (trader_amount_in_max.min(U256::from(U128::MAX)).as_u128() as f64
+                            / trader_token_amount.min(U256::from(U128::MAX)).as_u128() as f64
+                            * keyhash_token_balance.min(U256::from(U128::MAX)).as_u128() as f64) as u128,
                     )
+                    .max(min_token_sell)
                     .min(amount_in_balance);
 
                     let slippage_tollerance = new_amount_in_max
                         .checked_div(U256::from(100))
                         .unwrap_or_default()
-                        .checked_mul(U256::from(SLIPPAGE_TOLLERANCE))
+                        .checked_mul(U256::from(sell_slippage_tollerance))
                         .unwrap_or_default();
 
                     repeat_input_tokens[1] =
@@ -409,7 +460,7 @@ pub async fn handle_transaction(
             let slippage_tollerance = new_amount_out_min
                 .checked_div(U256::from(100))
                 .unwrap_or_default()
-                .checked_mul(U256::from(SLIPPAGE_TOLLERANCE))
+                .checked_mul(U256::from(buy_slippage_tollerance))
                 .unwrap_or_default();
 
             repeat_input_tokens[0] =
@@ -435,16 +486,19 @@ pub async fn handle_transaction(
             repeat_input_tokens[0] = Token::Uint(new_amount_out);
         }
     }
+    info!(timer_calculate_new_tx=%timer_tx_recieved.elapsed().as_millis());
+
     info!(%token_allowed);
 
     if token_allowed < U256::MAX {
+        info!("token_allowed: {token_allowed:?}/{:?}", U256::MAX);
         swap_tx.token_approve_max(PANCAKESWAP_ADDRESS).await?;
     }
 
     let slippage_tollerance = repeat_value
         .checked_div(U256::from(100))
         .unwrap_or_default()
-        .checked_mul(U256::from(SLIPPAGE_TOLLERANCE))
+        .checked_mul(U256::from(buy_slippage_tollerance))
         .unwrap_or_default();
 
     repeat_value = repeat_value
@@ -454,7 +508,7 @@ pub async fn handle_transaction(
     info!("Repeat input data: {:?}", repeat_input_tokens);
     info!("Repeat value: {:?}", repeat_value);
 
-    let gas_limit = tx.gas;
+    let gas_limit = tx.gas.max(U256::from(300000_u32));
     let gas_price = tx.gas_price.unwrap_or(U256::from(3000000000_u32));
 
     info!(?tx);
@@ -471,10 +525,23 @@ pub async fn handle_transaction(
     info!(?repeat_tx);
 
     let receipt = send_tx(provider, repeat_tx).await?;
-    let tx = provider.get_transaction(receipt.transaction_hash).await?;
-    let ids = ids.lock().unwrap().clone();
+    info!(timer_send_tx=%timer_tx_recieved.elapsed().as_millis());
 
-    for chat_id in ids.iter() {
+    let self_tx = SelfTx {
+        tx: receipt.transaction_hash,
+        key_hash: Some(keyhash),
+        action: None,
+        amount: None,
+    };
+
+    tx_repeated_tx.send(self_tx).await?;
+
+    let tx = provider.get_transaction(receipt.transaction_hash).await?;
+    info!(timer_get_tx=%timer_tx_recieved.elapsed().as_millis());
+    let mut conn = db_pool.get()?;
+    let chat_ids = conn.transaction(|conn| tg_chat_ids::table.load::<ChatIdEntry>(conn))?;
+
+    for chat_id_entry in chat_ids.iter() {
         let response = match receipt.status {
             Some(result) => {
                 if result.is_zero() {
@@ -485,7 +552,8 @@ pub async fn handle_transaction(
             }
             None => "Undefined tx result",
         };
-        bot.send_message(*chat_id, format!("{response}: https://bscscan.com/tx/{:?} \nOriginal tx: https://bscscan.com/tx/{:?}", receipt.transaction_hash, swap_tx.tx.hash)).await?;
+        let chat_id = chat_id_entry.chat_id;
+        bot.send_message(ChatId(chat_id), format!("{response}: https://bscscan.com/tx/{:?} \nOriginal tx: https://bscscan.com/tx/{:?}", receipt.transaction_hash, swap_tx.tx.hash)).await?;
     }
 
     info!("{tx:?}");

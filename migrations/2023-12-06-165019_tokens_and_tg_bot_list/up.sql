@@ -1,0 +1,7 @@
+ALTER TABLE tokens ADD symbol TEXT DEFAULT NULL;
+
+CREATE TABLE tg_chat_ids (
+  id SERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL
+);
+

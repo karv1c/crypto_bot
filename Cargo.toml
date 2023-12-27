@@ -22,7 +22,8 @@ tracing-appender = "0.2.2"
 tracing-subscriber = { version="0.3.17", features=["fmt"] }
 tracing-panic = "0.1.1"
 lazy_static = "1.4.0"
-teloxide = "0.12.2"
+teloxide = { version = "0.12", features = ["macros"] }
+kv = { version = "0.24.0", features = ["json-value"] }
 
 [build-dependencies]
 ethers = "2.0.10"
