@@ -53,6 +53,8 @@ diesel::table! {
         max_sell_seq -> Float8,
         cur_sell_seq -> Float8,
         active -> Bool,
+        profit -> Float4,
+        buy_sell -> Float4,
         ts -> Int8,
     }
 }

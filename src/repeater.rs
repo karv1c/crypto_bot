@@ -1,8 +1,8 @@
 use crate::common::*;
-use crate::schema::{tg_chat_ids, repeat_traders};
+use crate::schema::{repeat_traders, tg_chat_ids};
 use crate::telegram::ChatIdEntry;
-use crate::SharedSettings;
 use crate::trader::SelfTx;
+use crate::SharedSettings;
 use anyhow::{bail, Result};
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
@@ -92,7 +92,11 @@ pub struct RepeaterModule {
 }
 
 impl RepeaterModule {
-    pub fn new(db_pool: Pool<ConnectionManager<PgConnection>>, bot: Bot, tx_repeat_tx: tokio::sync::mpsc::Sender<SelfTx>) -> Self {
+    pub fn new(
+        db_pool: Pool<ConnectionManager<PgConnection>>,
+        bot: Bot,
+        tx_repeat_tx: tokio::sync::mpsc::Sender<SelfTx>,
+    ) -> Self {
         Self {
             db_pool,
             tx_queue: SwapQueue::new(),
@@ -125,7 +129,6 @@ impl RepeaterModule {
                 .await
                 {
                     error!("Error while handling tx: {e}");
-                    
                 }
             }
         });
@@ -163,19 +166,13 @@ pub async fn handle_transaction(
     bot: Bot,
     tx_repeated_tx: tokio::sync::mpsc::Sender<SelfTx>,
 ) -> Result<()> {
-
     let timer_tx_recieved = std::time::Instant::now();
     let settings_bucket = settings.lock().await;
-    let settings = settings_bucket
-        .get(&"trading_settings")
-        .ok()
-        .flatten()
-        .map(|x| x.0)
-        .unwrap_or_default();
+    let settings = settings_bucket.get();
 
-    let max_repeat = settings.max_repeat_traders as i64;
+    //let max_repeat = settings.max_repeat_traders as i64;
 
-    let Some(trader) = swap_tx.need_repeat(db_pool.clone(), max_repeat).await? else {
+    let Some(trader) = swap_tx.need_repeat(db_pool.clone(), &settings).await? else {
         return Ok(());
     };
 
@@ -268,16 +265,22 @@ pub async fn handle_transaction(
     let mut conn = db_pool.get()?;
     let keyhash = swap_tx.get_keyhash();
     let keyhash_token_balance: f64 = conn.transaction(|conn| {
-        repeat_traders::table.filter(repeat_traders::keyhash.eq(keyhash.clone())).select(repeat_traders::token_amount).first::<f64>(conn)
+        repeat_traders::table
+            .filter(repeat_traders::keyhash.eq(keyhash.clone()))
+            .select(repeat_traders::token_amount)
+            .first::<f64>(conn)
     })?;
 
-    let keyhash_token_balance = U256::from((keyhash_token_balance * 10.0f64.powi(token_decimals as i32)) as u128);
+    let keyhash_token_balance =
+        U256::from((keyhash_token_balance * 10.0f64.powi(token_decimals as i32)) as u128);
 
     let prim_balance = swap_tx.prim_balance(REAPEAT_ADDRESS).await?;
 
     if swap_tx.is_buy() {
-        let is_exceeded = swap_tx.is_exceeded(settings.max_total_usd_buy_limit, keyhash_token_balance).await?;
-        
+        let is_exceeded = swap_tx
+            .is_exceeded(settings.max_total_usd_buy_limit, keyhash_token_balance)
+            .await?;
+
         info!(timer_is_exceeded=%timer_tx_recieved.elapsed().as_millis());
         if is_exceeded {
             info!("Total token USD buy limit is exceeded");
@@ -340,8 +343,10 @@ pub async fn handle_transaction(
                 SwapAction::Sell => {
                     let min_token_sell = swap_tx.min_token_sell(min_usd_sell_limit).await?;
                     let new_amount_in = U256::from(
-                        (trader_amount_in.min(U256::from(U128::MAX)).as_u128() as f64 / trader_token_amount.min(U256::from(U128::MAX)).as_u128() as f64
-                            * keyhash_token_balance.min(U256::from(U128::MAX)).as_u128() as f64) as u128,
+                        (trader_amount_in.min(U256::from(U128::MAX)).as_u128() as f64
+                            / trader_token_amount.min(U256::from(U128::MAX)).as_u128() as f64
+                            * keyhash_token_balance.min(U256::from(U128::MAX)).as_u128() as f64)
+                            as u128,
                     )
                     .max(min_token_sell)
                     .min(amount_in_balance);
@@ -410,7 +415,8 @@ pub async fn handle_transaction(
                     let new_amount_in_max = U256::from(
                         (trader_amount_in_max.min(U256::from(U128::MAX)).as_u128() as f64
                             / trader_token_amount.min(U256::from(U128::MAX)).as_u128() as f64
-                            * keyhash_token_balance.min(U256::from(U128::MAX)).as_u128() as f64) as u128,
+                            * keyhash_token_balance.min(U256::from(U128::MAX)).as_u128() as f64)
+                            as u128,
                     )
                     .max(min_token_sell)
                     .min(amount_in_balance);
@@ -508,8 +514,9 @@ pub async fn handle_transaction(
     info!("Repeat input data: {:?}", repeat_input_tokens);
     info!("Repeat value: {:?}", repeat_value);
 
-    let gas_limit = tx.gas.max(U256::from(300000_u32));
-    let gas_price = tx.gas_price.unwrap_or(U256::from(3000000000_u32));
+    let gas_limit = tx.gas.max(U256::from(600000_u32));
+    let gas_price = tx.gas_price.unwrap_or(U256::from(4000000000_u64));
+    let gas_price = U256::from(gas_price + U256::from(1000000000_u64));
 
     info!(?tx);
 

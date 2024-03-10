@@ -39,9 +39,9 @@ lazy_static! {
 
 use std::str::FromStr;
 
-use crate::abi::*;
-use crate::schema::{self, repeat_traders};
-use crate::trader::{NewRepeatTraderEntry, NewTokenEntry, TokenEntry, TraderEntry};
+use crate::db::DbPoolConnection;
+use crate::trader::TraderEntry;
+use crate::{abi::*, TradingSettings};
 
 #[derive(
     Serialize,
@@ -183,23 +183,6 @@ impl SwapTx {
                 return status.then_some(receipt);
             }
         }
-
-        /* while let Ok(receipt) = self.context.provider.get_transaction_receipt(self.tx.hash).await {
-            /* let Some(receipt) = receipt else {
-                continue;
-            };
-            if attempts == 1 {
-                return None;
-            } */
-            if let Some(status) = receipt.status {
-                let status = !status.is_zero();
-                return status.then_some(receipt);
-            }/*  else {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                attempts += 1;
-                continue;
-            } */
-        } */
         None
     }
 
@@ -331,265 +314,125 @@ impl SwapTx {
     pub async fn need_repeat(
         &self,
         db_pool: Pool<ConnectionManager<PgConnection>>,
-        max_repeat: i64,
+        settings: &TradingSettings,
     ) -> Result<Option<TraderEntry>> {
-        let conn = &mut db_pool.get()?;
-
-        //let prim_address = self.addresses.prim_address;
-        let token_address = self.addresses.token_address;
+        let mut db_conn = DbPoolConnection::new(&db_pool)?;
 
         if self.from == H160::from_str(REAPEAT_ADDRESS)? {
             return Ok(None);
         }
 
         let key_hash = self.get_keyhash();
-
-        let trader: Option<TraderEntry> = conn.transaction(|conn| {
-            schema::traders::table
-                .filter(schema::traders::key_hash.eq(key_hash.clone()))
-                .first::<TraderEntry>(conn)
-                .optional()
-        })?;
+        let trader = db_conn.get_trader_entry_by_keyhash(&key_hash)?;
 
         let Some(trader) = trader else {
             return Ok(None);
         };
 
         if trader.active {
-            if trader.wmean_ratio > 1.1
-                && trader.sum_buy_usd_amount / trader.sum_sell_usd_amount > 0.6
+            if trader.wmean_ratio < 1.2
+                && trader.sum_buy_usd_amount / trader.sum_sell_usd_amount > 1.1
             {
-                return Ok(Some(trader));
-            } else {
                 let token_decimals = self.token_decimals().await?;
-                let keyhash_token_balance: f64 = conn.transaction(|conn| {
-                    repeat_traders::table
-                        .filter(repeat_traders::keyhash.eq(key_hash))
-                        .select(repeat_traders::token_amount)
-                        .first::<f64>(conn)
-                })?;
+                let keyhash_token_balance = db_conn.get_token_amount_by_keyhash(&key_hash)?;
 
                 let keyhash_token_balance = U256::from(
                     (keyhash_token_balance * 10.0f64.powi(token_decimals as i32)) as u128,
                 );
 
-                //let prim_balance = self.prim_balance(REAPEAT_ADDRESS).await?;
                 let tokens_left = self.token_balance(REAPEAT_ADDRESS).await?;
-                let repeat_address = H160::from_str(REAPEAT_ADDRESS).unwrap();
-                /* let trader_token_amount = U256::from(
-                    (trader.token_amount * 10.0_f64.powi(token_decimals as i32)) as u128,
-                ).min(tokens_left); */
-                info!("Selling tokens of {:?}", trader.trader);
-                let sell_tx = self.context.router_contract.swap_exact_tokens_for_eth(
-                    keyhash_token_balance.min(tokens_left),
-                    U256::zero(),
-                    vec![token_address, *WBNB_ADDRESS],
-                    repeat_address,
-                    U256::from(now() + 3 * 3600),
-                );
-                let gas_limit = self.tx.gas.max(U256::from(2000000_u32));
-                let gas_price = self.tx.gas_price.unwrap_or(U256::from(3000000000_u32));
-                let receipt = sell_tx
-                    .gas_price(gas_price)
-                    .from(repeat_address)
-                    .gas(gas_limit)
-                    .send()
-                    .await?
-                    .await?;
-                match receipt {
-                    Some(receipt) => {
-                        let tx = self
-                            .context
-                            .provider
-                            .get_transaction(receipt.transaction_hash)
-                            .await?;
-                        let buy_sell_ratio = trader.sum_buy_usd_amount / trader.sum_sell_usd_amount;
-                        info!(wmean_ratio=%trader.wmean_ratio, %buy_sell_ratio, "Trader's parameters are not met required anymore");
-                        info!("{tx:?}");
-                    }
-                    None => error!("No receipt for sell all traders tokens"),
-                }
 
-                conn.transaction(|conn| {
-                    diesel::update(schema::traders::table.find(trader.id))
-                        .set(schema::traders::active.eq(false))
-                        .execute(conn)?;
-                    diesel::delete(
-                        schema::repeat_traders::table
-                            .filter(schema::repeat_traders::keyhash.eq(trader.key_hash)),
-                    )
-                    .execute(conn)
-                })?;
+                info!("Selling tokens of {:?}", trader.trader);
+
+                db_conn.remove_unacceptable_repeat_trader(&trader)?;
+                let amount_in = keyhash_token_balance.min(tokens_left);
+                let receipt = trader
+                    .sell_traders_token(amount_in, self.context.clone())
+                    .await?;
+
+                let tx = self
+                    .context
+                    .provider
+                    .get_transaction(receipt.transaction_hash)
+                    .await?;
+                let buy_sell_ratio = trader.sum_buy_usd_amount / trader.sum_sell_usd_amount;
+                info!(wmean_ratio=%trader.wmean_ratio, %buy_sell_ratio, "Trader's parameters are not met required anymore");
+                info!("{tx:?}");
 
                 return Ok(None);
             }
-        }
-
-        let repeat: i64 =
-            conn.transaction(|conn| schema::repeat_traders::table.count().get_result(conn))?;
-
-        if repeat >= max_repeat {
-            return Ok(None);
+            return Ok(Some(trader));
         }
 
         if trader.buy_count > 5
             && trader.sell_count > 5
-            && trader.wmean_ratio > 1.3
-            && trader.wmean_ratio < 5.0
-            && trader.sum_buy_usd_amount / trader.sum_sell_usd_amount > 0.8
+            && trader.wmean_ratio > 1.6
+            && trader.wmean_ratio < 10.0
+            && trader.sum_buy_usd_amount / trader.sum_sell_usd_amount < 0.6
         {
-            // Search for token creation time and tradable
-            let token: Option<TokenEntry> = conn.transaction(|conn| {
-                schema::tokens::table
-                    .filter(schema::tokens::token.eq(trader.token.clone()))
-                    .first::<TokenEntry>(conn)
-                    .optional()
-            })?;
+            let token = db_conn.get_token_by_trader(&trader)?;
 
-            if let Some(token_entry) = token {
-                if now() - token_entry.creation_ts > 30 * 24 * 3600 {
-                    let new_repeat = NewRepeatTraderEntry {
-                        keyhash: self.get_keyhash(),
-                        token_amount: 0.0,
-                    };
-                    conn.transaction(|conn| {
-                        diesel::insert_into(schema::repeat_traders::table)
-                            .values(new_repeat)
-                            .execute(conn)
-                    })?;
-                    conn.transaction(|conn| {
-                        diesel::update(schema::traders::table.find(trader.id))
-                            .set(schema::traders::active.eq(true))
-                            .execute(conn)
-                    })?;
+            if token.is_none() {
+                let creation_ts = self.get_creation_ts().await?;
+                let symbol = self.symbol().await;
+                db_conn.insert_new_token(&trader.token, creation_ts, symbol.clone())?;
+            }
 
-                    let convertable_min_token = self.min_token_sell(5.0).await;
+            /* let token = match token {
+                Some(token) => token,
+                None => {
+                    let creation_ts = self.get_creation_ts().await?;
+                    let symbol = self.symbol().await;
+                    db_conn.insert_new_token(&trader.token, creation_ts, symbol.clone())?
+                }
+            }; */
 
-                    match convertable_min_token {
-                        Ok(convertable_min_token) => {
-                            if convertable_min_token.is_zero() {
-                                return Ok(None);
-                            }
-                        }
-                        Err(_) => return Ok(None),
-                    }
-                    return Ok(Some(trader));
-                    /* match token_entry.tradable {
-                        Some(tradable) => {
-                            if tradable {
-                                let new_repeat = NewRepeatTraderEntry {
-                                    keyhash: self.get_keyhash(),
-                                };
-                                conn.transaction(|conn| {
-                                    diesel::insert_into(schema::repeat_traders::table)
-                                        .values(new_repeat)
-                                        .execute(conn)
-                                })?;
-                                conn.transaction(|conn| {
-                                    diesel::update(schema::traders::table.find(trader.id))
-                                        .set(schema::traders::active.eq(true))
-                                        .execute(conn)
-                                })?;
-                                return Ok(Some(trader));
-                            } else {
-                                return Ok(None);
-                            }
-                        }
-                        None => {
-                            // MAKE TEST SWAP HERE!
-                        }
-                    } */
-                } else {
+            /* if now() - token.creation_ts < 21 * 24 * 3600 {
+                return Ok(None);
+            }
+
+            if !settings.allow_similar_tokens {
+                let tokens = db_conn.get_repeat_tokens()?;
+                if tokens.contains(&token.token) {
                     return Ok(None);
                 }
             }
 
-            let creation_ts = self.get_creation_ts().await?;
+            let repeat = db_conn.count_repeat_traders()?;
 
-            let symbol = self.symbol().await;
-
-            if now() - creation_ts > 30 * 24 * 3600 {
-                let new_token = NewTokenEntry {
-                    token: trader.token.clone(),
-                    creation_ts,
-                    tradable: None,
-                    symbol,
+            if repeat >= settings.max_repeat_traders as i64 {
+                let active_traders = db_conn.get_active_traders()?;
+                let repeat_traders = db_conn.get_repeat_traders()?;
+                let null_repeat_traders = repeat_traders
+                    .into_iter()
+                    .filter(|repeat| repeat.token_amount == 0.0)
+                    .map(|repeat| repeat.keyhash)
+                    .collect::<Vec<_>>();
+                let mut traders = active_traders
+                    .into_iter()
+                    .filter(|trader| null_repeat_traders.contains(&trader.key_hash))
+                    .collect::<Vec<_>>();
+                traders.sort_by(|a, b| a.ts.cmp(&b.ts));
+                let Some(first_trader) = traders.first() else {
+                    return Ok(None);
                 };
-                conn.transaction(|conn| {
-                    diesel::insert_into(schema::tokens::table)
-                        .values(new_token)
-                        .execute(conn)
-                })?;
-                let new_repeat = NewRepeatTraderEntry {
-                    keyhash: self.get_keyhash(),
-                    token_amount: 0.0,
-                };
-                conn.transaction(|conn| {
-                    diesel::insert_into(schema::repeat_traders::table)
-                        .values(new_repeat)
-                        .execute(conn)
-                })?;
-                conn.transaction(|conn| {
-                    diesel::update(schema::traders::table.find(trader.id))
-                        .set(schema::traders::active.eq(true))
-                        .execute(conn)
-                })?;
-
-                let convertable_min_token = self.min_token_sell(5.0).await;
-
-                match convertable_min_token {
-                    Ok(convertable_min_token) => {
-                        if convertable_min_token.is_zero() {
-                            return Ok(None);
-                        }
-                    }
-                    Err(_) => return Ok(None),
+                if now().saturating_sub(first_trader.ts)
+                    < 60 * 60 * settings.zero_traders_replacement as i64
+                {
+                    return Ok(None);
                 }
-
-                return Ok(Some(trader));
-                // MAKE TEST SWAP
-                /* let tradable = true; //self.is_tradable().await;
-                let new_token = NewTokenEntry {
-                    token: trader.token.clone(),
-                    creation_ts,
-                    tradable: Some(tradable),
-                };
-                conn.transaction(|conn| {
-                    diesel::insert_into(schema::tokens::table)
-                        .values(new_token)
-                        .execute(conn)
-                })?;
-                if tradable {
-                    let new_repeat = NewRepeatTraderEntry {
-                        keyhash: self.get_keyhash(),
-                    };
-                    conn.transaction(|conn| {
-                        diesel::insert_into(schema::repeat_traders::table)
-                            .values(new_repeat)
-                            .execute(conn)
-                    })?;
-                    conn.transaction(|conn| {
-                        diesel::update(schema::traders::table.find(trader.id))
-                            .set(schema::traders::active.eq(true))
-                            .execute(conn)
-                    })?;
-                    return Ok(Some(trader));
-                } */
-            } else {
-                let new_token = NewTokenEntry {
-                    token: trader.token.clone(),
-                    creation_ts,
-                    tradable: None,
-                    symbol,
-                };
-                conn.transaction(|conn| {
-                    diesel::insert_into(schema::tokens::table)
-                        .values(new_token)
-                        .execute(conn)
-                })?;
+                db_conn.remove_unacceptable_repeat_trader(&first_trader)?;
             }
-        }
 
+            db_conn.add_repeat_trader(&key_hash, trader.id)?;
+
+            let convertable_min_token = self.min_token_sell(5.0).await;
+
+            return match convertable_min_token {
+                Ok(convertable_min_token) if !convertable_min_token.is_zero() => Ok(Some(trader)),
+                _ => Ok(None),
+            }; */
+        }
         Ok(None)
     }
 
@@ -804,7 +647,6 @@ impl SwapTx {
     /// Minimum sell token amount in USD
     pub async fn min_token_sell(&self, min_usd_sell_amount: f64) -> Result<U256> {
         let token_address = self.token_address();
-        //let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
         let addresses = vec![*BP_BSC_USD_ADDRESS, token_address];
         if let Ok(min_token_amount) = self
             .context
@@ -816,24 +658,26 @@ impl SwapTx {
             .call()
             .await
         {
-            let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
-            let min_token_amount_wbnb = self
-                .context
-                .router_contract
-                .get_amounts_out(
-                    U256::from((min_usd_sell_amount * 10.0_f64.powi(18)) as u128),
-                    addresses,
-                )
-                .call()
-                .await?;
-            let Some(min_token_amount_wbnb) = min_token_amount_wbnb.last() else {
-                bail!("No last token amount");
-            };
-            let Some(min_token_amount) = min_token_amount.last() else {
-                bail!("No last token amount");
-            };
-            let result = min_token_amount.max(min_token_amount_wbnb);
-            return Ok(*result);
+            if let Some(min_token_amount) = min_token_amount.last() {
+                let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
+                if let Ok(min_token_amount_wbnb) = self
+                    .context
+                    .router_contract
+                    .get_amounts_out(
+                        U256::from((min_usd_sell_amount * 10.0_f64.powi(18)) as u128),
+                        addresses,
+                    )
+                    .call()
+                    .await
+                {
+                    if let Some(min_token_amount_wbnb) = min_token_amount_wbnb.last() {
+                        let result = min_token_amount.max(min_token_amount_wbnb);
+                        return Ok(*result);
+                    }
+                }
+                return Ok(*min_token_amount);
+            }
+            bail!("No last token amount");
         } else {
             let addresses = vec![*BP_BSC_USD_ADDRESS, *WBNB_ADDRESS, token_address];
             let min_token_amount_wbnb = self
@@ -844,11 +688,14 @@ impl SwapTx {
                     addresses,
                 )
                 .call()
-                .await?;
-            let Some(min_token_amount_wbnb) = min_token_amount_wbnb.last() else {
-                bail!("No last token amount");
-            };
-            return Ok(*min_token_amount_wbnb);
+                .await;
+            if let Ok(min_token_amount_wbnb) = min_token_amount_wbnb {
+                if let Some(min_token_amount_wbnb) = min_token_amount_wbnb.last() {
+                    return Ok(*min_token_amount_wbnb);
+                }
+            }
+
+            bail!("No last token amount");
         }
     }
 
@@ -1009,7 +856,7 @@ impl SwapContext {
 
         let router_contract = Pancake::new(H160::from_str(PANCAKESWAP_ADDRESS)?, provider.clone());
 
-        let token_aadr = H160::from_str("8a7b5fe6f43db70affc51f3881ff79354640f3e7").unwrap();
+        /* let token_aadr = H160::from_str("8a7b5fe6f43db70affc51f3881ff79354640f3e7").unwrap();
         let token = Erc20Token::new(token_aadr, provider.clone());
         let token_decimals = token.decimals().await? as i32;
         //let balance = token.balance_of(H160::from_str(REAPEAT_ADDRESS)?).call().await?;
@@ -1022,7 +869,7 @@ impl SwapContext {
             .call()
             .await?;
 
-        info!(?token_amount);
+        info!(?token_amount); */
         for address in eth {
             let prim_contract = Erc20Token::new(address, provider.clone());
 
