@@ -1,0 +1,13 @@
+start - Start watching for bot
+max_usd_buy_limit - Set max single buy limit in USD
+min_usd_buy_limit - Set min single buy limit in USD
+buy_slippage_tollerance - Set buy slippage tollerance
+sell_slippage_tollerance - Set sell slippage tollerance
+min_usd_sell_limit - Set min single sell limit in USD
+get_total_usd_balance - Get total USD balance
+max_repeat_traders - Set max repeat traders
+max_total_usd_buy_limit - Set maximum total USD buy limit
+get_settings - Get settings
+allow_similar_tokens - Allow similar token
+zero_traders_replacement - Replace traders with zero amount in hours
+inactive_days_sell - Sell tokens after n days

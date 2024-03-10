@@ -3,7 +3,6 @@ use diesel::{
     prelude::*,
     r2d2::{ConnectionManager, Pool},
 };
-use kv::Json;
 use teloxide::{prelude::*, utils::command::BotCommands};
 
 use crate::{schema, RequsetTotalUsdBalance, SharedSettings};
@@ -40,6 +39,9 @@ pub enum Command {
     MaxRepeatTraders(i32),
     MaxTotalUsdBuyLimit(f64),
     GetSettings,
+    AllowSimilarTokens(bool),
+    ZeroTradersReplacement(i32),
+    InactiveDaysSell(i32),
 }
 
 pub async fn run(
@@ -153,6 +155,33 @@ pub async fn run(
                         .await
                     }
                     Command::GetSettings => get_settings(bot, msg.clone(), settings.clone()).await,
+                    Command::AllowSimilarTokens(enable) => {
+                        set(
+                            bot,
+                            msg.clone(),
+                            settings.clone(),
+                            Command::AllowSimilarTokens(enable),
+                        )
+                        .await
+                    }
+                    Command::ZeroTradersReplacement(hours) => {
+                        set(
+                            bot,
+                            msg.clone(),
+                            settings.clone(),
+                            Command::ZeroTradersReplacement(hours),
+                        )
+                        .await
+                    }
+                    Command::InactiveDaysSell(days) => {
+                        set(
+                            bot,
+                            msg.clone(),
+                            settings.clone(),
+                            Command::InactiveDaysSell(days),
+                        )
+                        .await
+                    }
                 };
 
                 result.into()
@@ -209,12 +238,7 @@ pub async fn start(
 
 pub async fn set(bot: Bot, msg: Message, settings: SharedSettings, command: Command) -> Result<()> {
     let settings_guard = settings.lock().await;
-    let mut update_settings = settings_guard
-        .get(&"trading_settings")
-        .ok()
-        .flatten()
-        .map(|x| x.0)
-        .unwrap_or_default();
+    let mut update_settings = settings_guard.get();
     let response;
     match command {
         Command::MaxUsdBuyLimit(max_usd_buy_limit) => {
@@ -245,10 +269,34 @@ pub async fn set(bot: Bot, msg: Message, settings: SharedSettings, command: Comm
             update_settings.max_total_usd_buy_limit = max_total_usd_buy_limit;
             response = format!("Max total USD buy limit {max_total_usd_buy_limit}");
         }
+        Command::AllowSimilarTokens(enable) => {
+            update_settings.allow_similar_tokens = enable;
+            let enable = match enable {
+                true => "enabled",
+                false => "disabled",
+            };
+            response = format!("Similar tokens are {enable}");
+        }
+        Command::ZeroTradersReplacement(hours) => {
+            update_settings.zero_traders_replacement = hours;
+            response = format!("Zero traders replaced allowed in {hours} hours");
+        }
+        Command::InactiveDaysSell(days) => {
+            update_settings.inactive_days_sell = days;
+            response = format!("Inactive traders will sell all tokens in {days} days");
+        }
         _ => response = format!("No set command"),
     };
 
-    match settings_guard.set(&"trading_settings", &Json(update_settings)) {
+    match settings_guard.set(update_settings) {
+        Ok(_) => bot.send_message(msg.chat.id, response).await?,
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("Error settings new value: {e}"))
+                .await?
+        }
+    };
+
+    /* match settings_guard.set(&"trading_settings", &Json(update_settings)) {
         Ok(_) => {
             settings_guard.flush()?;
             //let x = bot.send_message(msg.chat.id, response).await;
@@ -258,7 +306,7 @@ pub async fn set(bot: Bot, msg: Message, settings: SharedSettings, command: Comm
             bot.send_message(msg.chat.id, format!("Error settings new value: {e}"))
                 .await?
         }
-    };
+    }; */
     //let c = z.await?;
 
     Ok(())
@@ -279,12 +327,7 @@ pub async fn get_usd_balance(
 
 pub async fn get_settings(bot: Bot, msg: Message, settings: SharedSettings) -> Result<()> {
     let settings_guard = settings.lock().await;
-    let settings = settings_guard
-        .get(&"trading_settings")
-        .ok()
-        .flatten()
-        .map(|x| x.0)
-        .unwrap_or_default();
+    let settings = settings_guard.get();
     bot.send_message(msg.chat.id, format!("{settings:?}"))
         .await?;
 

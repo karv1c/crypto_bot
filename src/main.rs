@@ -1,4 +1,5 @@
 pub mod common;
+mod db;
 mod repeater;
 mod request;
 pub mod schema;
@@ -23,9 +24,46 @@ use crate::trader::SelfTx;
 use crate::trader::TraderModule;
 pub mod abi;
 
-pub type SharedSettings = Arc<tokio::sync::Mutex<Bucket<'static, &'static str, Json<TradingSettings>>>>;
+/* pub type SharedSettings =
+    Arc<tokio::sync::Mutex<Bucket<'static, &'static str, Json<TradingSettings>>>>; */
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub type SharedSettings =
+    Arc<tokio::sync::Mutex<BucketSettings>>;
+
+pub struct BucketSettings(Bucket<'static, &'static str, Json<TradingSettings>>);
+
+impl BucketSettings {
+    pub fn new(settings: Bucket<'static, &'static str, Json<TradingSettings>>) -> Self {
+        Self(settings)
+    }
+
+    pub fn get(&self) -> TradingSettings {
+        self.0
+            .get(&"trading_settings")
+            .ok()
+            .flatten()
+            .map(|x| x.0)
+            .unwrap_or_default()
+    }
+
+    pub fn set(&self, update_settings: TradingSettings) -> Result<Option<TradingSettings>, kv::Error> {
+        let res = self.0.set(&"trading_settings", &Json(update_settings))?;
+        self.0.flush()?;
+        Ok(res.map(|json| json.0))
+    }
+}
+
+/* pub struct SharedSettings(Arc<tokio::sync::Mutex<Bucket<'static, &'static str, Json<TradingSettings>>>>);
+
+impl SharedSettings {
+    fn new(settings: Arc<tokio::sync::Mutex<Bucket<'static, &'static str, Json<TradingSettings>>>>) -> Self {
+        Self(settings)
+    }
+
+    fn get()
+} */
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
 pub struct TradingSettings {
     max_usd_buy_limit: f64,
     min_usd_buy_limit: f64,
@@ -34,6 +72,20 @@ pub struct TradingSettings {
     min_usd_sell_limit: f64,
     max_total_usd_buy_limit: f64,
     max_repeat_traders: i32,
+    #[serde(default)]
+    allow_similar_tokens: bool,
+    #[serde(default = "default_zero_traders_replacement_hours")]
+    zero_traders_replacement: i32,
+    #[serde(default = "default_inactive_days_sell")]
+    inactive_days_sell: i32,
+}
+
+fn default_zero_traders_replacement_hours() -> i32 {
+    999
+}
+
+fn default_inactive_days_sell() -> i32 {
+    2
 }
 
 impl Default for TradingSettings {
@@ -46,6 +98,9 @@ impl Default for TradingSettings {
             min_usd_sell_limit: 3.0,
             max_total_usd_buy_limit: 20.0,
             max_repeat_traders: 4,
+            allow_similar_tokens: false,
+            zero_traders_replacement: 999,
+            inactive_days_sell: 2,
         }
     }
 }
@@ -73,9 +128,11 @@ async fn main() -> Result<()> {
     let store = Store::new(cfg)?;
 
     let bucket = store.bucket::<&str, Json<TradingSettings>>(None)?;
-    let settings_bucket = Arc::new(tokio::sync::Mutex::new(bucket));
+    let settings_bucket = Arc::new(tokio::sync::Mutex::new(BucketSettings::new(bucket)));
 
-    let bot = Bot::from_env();
+    dotenv().ok();
+    let bot_env = env::var("TELOXIDE_TOKEN").expect("TELOXIDE_TOKEN must be set");
+    let bot = Bot::new(bot_env);
     //let telegram_ids = Arc::new(Mutex::new(Vec::new()));
 
     let pool = get_connection_pool();
@@ -92,9 +149,18 @@ async fn main() -> Result<()> {
         }
     });
 
+    let bot_clone = bot.clone();
+
     let pool_clone = pool.clone();
+    let settings = settings_bucket.clone();
     let trader = tokio::spawn(async move {
-        let mut trader = TraderModule::new(rx_total_usd_balance, rx_repeated_tx, pool_clone.clone());
+        let mut trader = TraderModule::new(
+            rx_total_usd_balance,
+            rx_repeated_tx,
+            pool_clone.clone(),
+            bot_clone,
+            settings,
+        );
         if let Err(e) = trader.run(rx_tx, pool_clone).await {
             error!("Error: {e}");
         }
@@ -112,7 +178,9 @@ async fn main() -> Result<()> {
     });
 
     tokio::spawn(async move {
-        if let Err(e) = telegram::run(bot, pool.clone(), settings_bucket, tx_total_usd_balance).await {
+        if let Err(e) =
+            telegram::run(bot, pool.clone(), settings_bucket, tx_total_usd_balance).await
+        {
             error!("Error: {e}");
         }
     });

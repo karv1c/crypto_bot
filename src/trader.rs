@@ -1,10 +1,13 @@
 use crate::abi::Erc20Token;
 use crate::common::*;
+use crate::db::DbPoolConnection;
 use crate::schema::repeat_traders;
 use crate::schema::tokens;
 use crate::schema::traders;
 use crate::schema::transactions;
+use crate::telegram::ChatIdEntry;
 use crate::RequsetTotalUsdBalance;
+use crate::SharedSettings;
 use anyhow::{anyhow, bail, Result};
 use diesel::prelude::*;
 use diesel::r2d2::ConnectionManager;
@@ -15,6 +18,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use teloxide::requests::Requester;
+use teloxide::types::ChatId;
+use teloxide::Bot;
 use tokio::{select, sync::broadcast::Receiver};
 use tracing::error;
 use tracing::info;
@@ -132,7 +137,73 @@ pub struct TraderEntry {
     pub max_sell_seq: f64,
     pub cur_sell_seq: f64,
     pub active: bool,
+    pub profit: f32,
+    pub buy_sell: f32,
     pub ts: i64,
+}
+
+impl TraderEntry {
+    pub async fn sell_traders_token(
+        &self,
+        amount_in: U256,
+        context: Arc<SwapContext>,
+    ) -> Result<TransactionReceipt> {
+        let repeat_address = H160::from_str(REAPEAT_ADDRESS).unwrap();
+        let token_address = H160::from_str(&self.token).unwrap();
+        for case in SellAllCase::all() {
+            let amount_out_min = match case.compute_amount {
+                true => {
+                    let amount_out_min = context
+                        .router_contract
+                        .get_amounts_out(amount_in, vec![token_address, case.address])
+                        .call()
+                        .await;
+                    let Ok(amount_out_min) = amount_out_min else {
+                        continue;
+                    };
+                    let Some(amount_out_min) = amount_out_min.last() else {
+                        continue;
+                    };
+                    *amount_out_min
+                }
+                false => U256::zero(),
+            };
+            let sell_tx = context.router_contract.swap_exact_tokens_for_eth(
+                amount_in,
+                amount_out_min,
+                vec![token_address, case.address],
+                repeat_address,
+                U256::from(now() + 3 * 3600),
+            );
+            let gas_limit = U256::from(2000000_u32);
+            let gas_price = U256::from(3000000000_u32);
+            let receipt = sell_tx
+                .gas_price(gas_price)
+                .from(repeat_address)
+                .gas(gas_limit)
+                .send()
+                .await?
+                .await;
+
+            let receipt = match receipt {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Error selling traders tokens {e}");
+                    continue;
+                }
+            };
+
+            let Some(receipt) = receipt else {
+                bail!("No receipt for sell all traders tokens {case:?}, Token: {token_address:#x}");
+            };
+            if let Some(status) = receipt.status {
+                if !status.is_zero() {
+                    return Ok(receipt);
+                }
+            }
+        }
+        bail!("All attempts to sell traders token failed. Token: {token_address:#x}");
+    }
 }
 
 #[derive(Insertable, Debug)]
@@ -163,6 +234,8 @@ pub struct NewTraderEntry {
     pub max_sell_seq: f64,
     pub cur_sell_seq: f64,
     pub active: bool,
+    pub profit: f32,
+    pub buy_sell: f32,
     pub ts: i64,
 }
 
@@ -172,6 +245,8 @@ pub struct TraderModule {
     pub db_pool: Pool<ConnectionManager<PgConnection>>,
     pub rx_repeated_tx: tokio::sync::mpsc::Receiver<SelfTx>,
     pub self_tx_pool: HashMap<H256, SelfTx>,
+    pub bot: Bot,
+    pub settings: SharedSettings,
 }
 
 #[derive(Clone)]
@@ -216,6 +291,8 @@ impl TraderModule {
         rx_total_usd_balance: tokio::sync::mpsc::Receiver<RequsetTotalUsdBalance>,
         rx_repeated_tx: tokio::sync::mpsc::Receiver<SelfTx>,
         db_pool: Pool<ConnectionManager<PgConnection>>,
+        bot: Bot,
+        settings: SharedSettings,
     ) -> Self {
         Self {
             context: None,
@@ -223,6 +300,8 @@ impl TraderModule {
             db_pool,
             rx_repeated_tx,
             self_tx_pool: HashMap::new(),
+            bot,
+            settings,
         }
     }
 
@@ -434,7 +513,6 @@ impl TraderModule {
                 key_hash: None,
                 action: Some(swap_tx.action.clone()),
                 amount: Some(token_amount),
-                
             };
             self.add_self_tx(Some(self_tx)).await?;
         }
@@ -446,6 +524,14 @@ impl TraderModule {
         let token = token_address.as_bytes().to_vec();
         let usd_amount = prim_amount * usd_per_prim;
 
+        let ts = if let Some(block) = receipt.block_number {
+            let res = swap_tx.context.provider.get_block(block).await?;
+            res.map(|block| block.timestamp.as_u64() as i64)
+                .unwrap_or(now())
+        } else {
+            now()
+        };
+
         let tx_entry = NewTxEntry {
             trader: encode_hex(&trader_address),
             prim: encode_hex(&prim),
@@ -456,7 +542,7 @@ impl TraderModule {
             token_amount,
             prim_amount,
             swap_action: swap_tx.action.to_string(),
-            ts: now(),
+            ts,
             price_usd: price * usd_per_prim,
             usd_amount,
         };
@@ -496,7 +582,7 @@ impl TraderModule {
                 let cur_buy_seq: f64;
                 let max_sell_seq: f64;
                 let cur_sell_seq: f64;
-                let ts = now();
+                let ts = ts;
                 match swap_tx.action {
                     SwapAction::Buy => {
                         new_deposit = trader.deposit - prim_amount;
@@ -560,6 +646,11 @@ impl TraderModule {
                 } else {
                     0.0
                 } as f32;
+
+                let buy_sell = (buy_count as f32) / (sell_count as f32);
+
+                let profit = ((buy_count + sell_count) as f32) / 2.0 * wmean_ratio;
+
                 if let Err(e) = conn.transaction(|conn| {
                     diesel::update(schema::traders::table.find(trader.id))
                         .set((
@@ -584,6 +675,8 @@ impl TraderModule {
                             schema::traders::cur_buy_seq.eq(cur_buy_seq),
                             schema::traders::max_sell_seq.eq(max_sell_seq),
                             schema::traders::cur_sell_seq.eq(cur_sell_seq),
+                            schema::traders::profit.eq(profit),
+                            schema::traders::buy_sell.eq(buy_sell),
                             schema::traders::ts.eq(ts),
                         ))
                         .execute(conn)
@@ -613,7 +706,9 @@ impl TraderModule {
                 let cur_buy_seq: f64;
                 let max_sell_seq: f64;
                 let cur_sell_seq: f64;
-                let ts = now();
+                let profit = 0.0;
+                let buy_sell = 0.0;
+                let ts = ts;
                 match swap_tx.action {
                     SwapAction::Buy => {
                         new_deposit = -usd_amount;
@@ -693,6 +788,8 @@ impl TraderModule {
                     max_sell_seq,
                     cur_sell_seq,
                     active: false,
+                    profit,
+                    buy_sell,
                     ts,
                 };
 
@@ -724,7 +821,12 @@ impl TraderModule {
                     //.select((traders::id, traders::ts))
                     .first::<TraderEntry>(conn)
             })?;
-            if now().saturating_sub(trader_entry.ts) > 60 * 60 * 24 * 2 {
+
+            let settings_bucket = self.settings.lock().await;
+            let settings = settings_bucket.get();
+            let inactive_days_sell = settings.inactive_days_sell as i64;
+
+            if now().saturating_sub(trader_entry.ts) > 60 * 60 * 24 * inactive_days_sell {
                 conn.transaction(|conn| {
                     diesel::update(schema::traders::table.find(trader_entry.id))
                         .set(schema::traders::active.eq(false))
@@ -743,39 +845,21 @@ impl TraderModule {
 
                 let token_decimals = token_contract.decimals().call().await? as i32;
 
-                let keyhash_token_balance = U256::from((repeat_traders_entry.token_amount * 10.0f64.powi(token_decimals as i32)) as u128);
+                let keyhash_token_balance = U256::from(
+                    (repeat_traders_entry.token_amount * 10.0f64.powi(token_decimals as i32))
+                        as u128,
+                );
                 let token_balance = token_contract.balance_of(repeat_address).await?;
 
                 info!(
                     "Selling tokens of inactive trader {:?}",
                     trader_entry.trader
                 );
-                let sell_tx = context.router_contract.swap_exact_tokens_for_eth(
-                    keyhash_token_balance.min(token_balance),
-                    U256::zero(),
-                    vec![token_address, *WBNB_ADDRESS],
-                    repeat_address,
-                    U256::from(now() + 3 * 3600),
-                );
-                let gas_limit = U256::from(2000000_u32);
-                let gas_price = U256::from(3000000000_u32);
-                let receipt = sell_tx
-                    .gas_price(gas_price)
-                    .from(repeat_address)
-                    .gas(gas_limit)
-                    .send()
-                    .await?
+
+                let amount_in = keyhash_token_balance.min(token_balance);
+                trader_entry
+                    .sell_traders_token(amount_in, context.clone())
                     .await?;
-                match receipt {
-                    Some(receipt) => {
-                        let tx = context
-                            .provider
-                            .get_transaction(receipt.transaction_hash)
-                            .await?;
-                        info!("Trader with tokens removed from bot: {tx:?}");
-                    }
-                    None => error!("No receipt for sell all traders tokens"),
-                }
             }
         }
         Ok(())
@@ -784,18 +868,107 @@ impl TraderModule {
     pub async fn clean_db(&self, db_pool: Pool<ConnectionManager<PgConnection>>) -> Result<()> {
         let mut conn = db_pool.get()?;
         let traders_count: usize = conn.transaction(|conn| {
-            diesel::delete(traders::table.filter(traders::ts.lt(now() - 60 * 60 * 24 * 14)))
+            diesel::delete(traders::table.filter(traders::ts.lt(now() - 60 * 60 * 24 * 30)))
                 .execute(conn)
         })?;
 
         let tx_count: usize = conn.transaction(|conn| {
             diesel::delete(
-                transactions::table.filter(transactions::ts.lt(now() - 60 * 60 * 24 * 14)),
+                transactions::table.filter(transactions::ts.lt(now() - 60 * 60 * 24 * 30)),
             )
             .execute(conn)
         })?;
 
         info!(%traders_count, %tx_count, "Database cleaned.");
+        Ok(())
+    }
+
+    pub async fn check_repeat_traders_availability(
+        &self,
+        //db_pool: Pool<ConnectionManager<PgConnection>>,
+    ) -> Result<()> {
+        let mut db_conn = DbPoolConnection::new(&self.db_pool)?;
+
+        let mut repeat = db_conn.count_repeat_traders()?;
+        let settings = self.settings.lock().await;
+        let settings = settings.get();
+
+        if repeat >= settings.max_repeat_traders as i64 {
+            let Some(context) = self.context.clone() else {
+                return Ok(());
+            };
+
+            /* message = format!(
+                "{message}{symbol}: {}$ \n",
+                (token_usd_balance / U256::pow(U256::from(10), U256::from(18))).as_u64()
+            ); */
+
+            let active_traders = db_conn.get_active_traders()?;
+            let repeat_traders = db_conn.get_repeat_traders()?;
+            let mut repeat_traders_with_usd = Vec::new();
+            for repeat in &repeat_traders {
+                let Some(trader) = db_conn.get_trader_entry_by_keyhash(&repeat.keyhash)? else {
+                    continue;
+                };
+
+                let Some(token) = db_conn.get_token_by_trader(&trader)? else {
+                    continue;
+                };
+                /* let x = db_conn.get_token_by_trader(&trader)?;
+                let Some(token) = db_conn.get_token_by_trader(&trader)? else {
+                    continue;
+                }; */
+                let token_usd_balance = context
+                    .get_token_usd_balance(H160::from_str(&token.token).unwrap())
+                    .await
+                    .unwrap_or_default();
+                let token_usd_balance =
+                    (token_usd_balance / U256::pow(U256::from(10), U256::from(18))).as_u64();
+
+                repeat_traders_with_usd.push((repeat.clone(), token_usd_balance))
+            }
+
+            let null_repeat_traders = repeat_traders_with_usd
+                .into_iter()
+                .filter(|repeat| repeat.1 == 0)
+                .map(|repeat| repeat.0.keyhash.clone())
+                .collect::<Vec<_>>();
+            let mut traders = active_traders
+                .into_iter()
+                .filter(|trader| null_repeat_traders.contains(&trader.key_hash))
+                .collect::<Vec<_>>();
+            traders.sort_by(|a, b| a.ts.cmp(&b.ts));
+            let Some(first_trader) = traders.first() else {
+                return Ok(());
+            };
+            if now().saturating_sub(first_trader.ts)
+                < 60 * 60 * settings.zero_traders_replacement as i64
+            {
+                return Ok(());
+            }
+            db_conn.remove_unacceptable_repeat_trader(&first_trader)?;
+        }
+
+        let mut repeat = db_conn.count_repeat_traders()?;
+
+        let repeat_tokens = db_conn.get_repeat_tokens()?;
+
+        let mut best_traders =
+            db_conn.get_best_trader(repeat_tokens, settings.allow_similar_tokens)?;
+        best_traders.sort_by(|a, b| b.profit.total_cmp(&a.profit));
+        for best_trader in &best_traders {
+            if repeat >= settings.max_repeat_traders as i64 {
+                return Ok(());
+            }
+            let token = db_conn.get_token_by_trader(best_trader)?;
+            if let Some(token) = token {
+                if now() - token.creation_ts > 21 * 24 * 3600 {
+                    db_conn.add_repeat_trader(&best_trader.key_hash, best_trader.id)?;
+                    repeat += 1;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -819,7 +992,7 @@ impl TraderModule {
                         } else {
                             repeat_trader.token_amount -= completed_self_tx.amount.unwrap();
                         }
-                        
+
                         diesel::update(repeat_traders::table.find(repeat_trader.id))
                             .set(repeat_trader)
                             .execute(conn)
@@ -929,6 +1102,9 @@ impl TraderModule {
         let mut db_clear_interval =
             tokio::time::interval(std::time::Duration::from_secs(60 * 60 * 24));
 
+        let mut repeat_traders_add_interval =
+            tokio::time::interval(std::time::Duration::from_secs(60));
+
         loop {
             select! {
                 m = rx_tx.recv() => {
@@ -938,6 +1114,7 @@ impl TraderModule {
                     }
                 },
                 _ = repeat_traders_clear_interval.tick() => if let Err(e) = self.clean_inactive_traders(db_pool.clone()).await {
+                    let _ = notify_bot(self.bot.clone(), db_pool.clone(), &e).await;
                     error!("Error cleaning repeat traders: {e}");
                 },
                 m = self.rx_total_usd_balance.recv() => {
@@ -949,11 +1126,55 @@ impl TraderModule {
                     if let Err(e) = self.add_self_tx(m).await {
                         error!("Error adding self_tx from repeater: {e}");
                     }
-                }
+                },
                 _ = db_clear_interval.tick() => if let Err(e) = self.clean_db(db_pool.clone()).await {
                     error!("Error cleaning databases: {e}");
                 },
+                _ = repeat_traders_add_interval.tick() => {
+                    if let Err(e) = self.check_repeat_traders_availability().await {
+                        error!("Error adding new reapeat trader: {e}");
+
+                    }
+                },
             }
+        }
+    }
+}
+
+pub async fn notify_bot<D: std::fmt::Display>(
+    bot: Bot,
+    db_pool: Pool<ConnectionManager<PgConnection>>,
+    msg: D,
+) -> Result<()> {
+    let mut conn = db_pool.get()?;
+    let chat_ids = conn.transaction(|conn| schema::tg_chat_ids::table.load::<ChatIdEntry>(conn))?;
+    for chat_id_entry in chat_ids.iter() {
+        let chat_id = chat_id_entry.chat_id;
+        bot.send_message(ChatId(chat_id), format!("{msg}")).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct SellAllCase {
+    pub compute_amount: bool,
+    pub address: H160,
+}
+
+impl SellAllCase {
+    pub fn all() -> [SellAllCase; 4] {
+        [
+            Self::new(false, *WBNB_ADDRESS),
+            Self::new(true, *WBNB_ADDRESS),
+            Self::new(false, *BP_BSC_USD_ADDRESS),
+            Self::new(true, *BP_BSC_USD_ADDRESS),
+        ]
+    }
+
+    fn new(compute_amount: bool, address: H160) -> Self {
+        Self {
+            compute_amount,
+            address,
         }
     }
 }
